@@ -1,0 +1,174 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function hasProfile() {
+      return signedIn() && exists(userPath(request.auth.uid));
+    }
+
+    function myProfile() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function businessMember(businessId) {
+      return hasProfile()
+        && myProfile().businessId == businessId
+        && myProfile().role in ['owner', 'staff'];
+    }
+
+    function businessOwner(businessId) {
+      return hasProfile()
+        && myProfile().businessId == businessId
+        && myProfile().role == 'owner';
+    }
+
+    function linkedCustomer(customerId, businessId) {
+      return hasProfile()
+        && myProfile().role == 'customer'
+        && myProfile().customerId == customerId
+        && myProfile().businessId == businessId
+        && exists(/databases/$(database)/documents/customers/$(customerId))
+        && get(/databases/$(database)/documents/customers/$(customerId)).data.businessId == businessId
+        && get(/databases/$(database)/documents/customers/$(customerId)).data.portalUserId == request.auth.uid;
+    }
+
+    function customerBelongsToBusiness(customerId, businessId) {
+      return exists(/databases/$(database)/documents/customers/$(customerId))
+        && get(/databases/$(database)/documents/customers/$(customerId)).data.businessId == businessId;
+    }
+
+    match /users/{uid} {
+      allow get: if signedIn() && (
+        request.auth.uid == uid
+        || businessMember(resource.data.businessId)
+      );
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role in ['owner', 'customer']
+        && ((request.resource.data.role == 'owner' && request.resource.data.businessId == uid)
+          || (request.resource.data.role == 'customer' && request.resource.data.businessId == ''));
+
+      allow update: if signedIn() && (
+        (request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'email', 'phone', 'updatedAt'])
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.businessId == resource.data.businessId)
+        || (businessOwner(request.resource.data.businessId)
+          && request.resource.data.businessId == resource.data.businessId
+          && request.resource.data.businessId == myProfile().businessId
+          && resource.data.role in ['staff', 'customer']
+          && request.resource.data.role in ['staff', 'customer'])
+        || (businessOwner(request.resource.data.businessId)
+          && resource.data.role == 'customer'
+          && resource.data.businessId == ''
+          && request.resource.data.businessId == myProfile().businessId
+          && request.resource.data.role in ['customer', 'staff'])
+      );
+
+      allow delete: if false;
+
+      match /notifications/{notificationId} {
+        allow get, list: if signedIn() && request.auth.uid == uid;
+        allow create, delete: if false;
+        allow update: if signedIn()
+          && request.auth.uid == uid
+          && resource.data.readAt == null
+          && request.resource.data.readAt is timestamp
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt']);
+      }
+
+      match /devices/{deviceId} {
+        allow get, list: if false;
+        allow create, update: if signedIn()
+          && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['token', 'updatedAt'])
+          && request.resource.data.token is string
+          && request.resource.data.updatedAt is timestamp;
+        allow delete: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    match /businesses/{businessId} {
+      allow read: if businessMember(businessId);
+      allow create: if signedIn()
+        && request.auth.uid == businessId
+        && request.resource.data.ownerUid == request.auth.uid
+        && getAfter(userPath(request.auth.uid)).data.role == 'owner'
+        && getAfter(userPath(request.auth.uid)).data.businessId == businessId;
+      allow update: if businessOwner(businessId)
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if false;
+    }
+
+    match /customers/{customerId} {
+      allow read: if businessMember(resource.data.businessId)
+        || (signedIn() && resource.data.portalUserId == request.auth.uid);
+      allow create: if businessMember(request.resource.data.businessId)
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if businessMember(resource.data.businessId)
+        && request.resource.data.businessId == resource.data.businessId
+        && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if false;
+    }
+
+    match /debts/{debtId} {
+      allow read: if businessMember(resource.data.businessId)
+        || linkedCustomer(resource.data.customerId, resource.data.businessId);
+      allow create: if businessMember(request.resource.data.businessId)
+        && customerBelongsToBusiness(request.resource.data.customerId, request.resource.data.businessId)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.totalAmount > 0
+        && request.resource.data.amountPaid >= 0
+        && request.resource.data.amountPaid <= request.resource.data.totalAmount
+        && request.resource.data.balance == request.resource.data.totalAmount - request.resource.data.amountPaid;
+      allow update: if businessMember(resource.data.businessId)
+        && request.resource.data.businessId == resource.data.businessId
+        && request.resource.data.customerId == resource.data.customerId
+        && request.resource.data.totalAmount == resource.data.totalAmount
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['amountPaid', 'balance', 'status', 'updatedAt'])
+        && request.resource.data.amountPaid >= resource.data.amountPaid
+        && request.resource.data.amountPaid <= resource.data.totalAmount
+        && request.resource.data.balance == request.resource.data.totalAmount - request.resource.data.amountPaid;
+      allow delete: if false;
+    }
+
+    match /payments/{paymentId} {
+      allow read: if businessMember(resource.data.businessId)
+        || linkedCustomer(resource.data.customerId, resource.data.businessId);
+      allow create: if businessMember(request.resource.data.businessId)
+        && request.resource.data.amount > 0
+        && request.resource.data.createdBy == request.auth.uid
+        && getAfter(/databases/$(database)/documents/debts/$(request.resource.data.debtId)).data.businessId == request.resource.data.businessId
+        && getAfter(/databases/$(database)/documents/debts/$(request.resource.data.debtId)).data.customerId == request.resource.data.customerId;
+      allow update, delete: if false;
+    }
+
+    match /followUps/{followUpId} {
+      allow read: if businessMember(resource.data.businessId);
+      allow create: if businessMember(request.resource.data.businessId)
+        && request.resource.data.createdBy == request.auth.uid
+        && customerBelongsToBusiness(request.resource.data.customerId, request.resource.data.businessId);
+      allow update, delete: if false;
+    }
+
+    match /reminders/{reminderId} {
+      allow read: if businessMember(resource.data.businessId);
+      allow create: if businessMember(request.resource.data.businessId)
+        && request.resource.data.createdBy == request.auth.uid
+        && customerBelongsToBusiness(request.resource.data.customerId, request.resource.data.businessId);
+      allow update: if businessMember(resource.data.businessId)
+        && request.resource.data.businessId == resource.data.businessId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'channel', 'composedAt']);
+      allow delete: if false;
+    }
+  }
+}
